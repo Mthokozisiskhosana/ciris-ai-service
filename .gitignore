@@ -1,0 +1,35 @@
+# Trained models — large binaries (classifier.pkl is ~36 MB) that change on
+# every retrain, and git keeps every old version forever. Share them via a
+# GitHub Release or Google Drive instead, then place them next to main.py:
+#   classifier.pkl, duplicate_model.pkl
+*.pkl
+*.joblib
+*.h5
+*.keras
+*.pt
+*.onnx
+
+# Training data
+dataset/
+datasets/
+data/
+
+# Python virtual environment — recreate with:
+#   python -m venv venv && venv\Scripts\pip install -r requirements.txt
+venv/
+.venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Secrets
+.env
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
