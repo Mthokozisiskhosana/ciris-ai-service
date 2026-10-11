@@ -1,0 +1,40 @@
+{
+  "classes": [
+    "other",
+    "pothole",
+    "streetlight",
+    "traffic_light",
+    "water_leak"
+  ],
+  "confidence_threshold": 0.3,
+  "image_size": 224,
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "resize": "stretch to square, bilinear",
+  "feature_extractor": "torchvision efficientnet_b0 IMAGENET1K_V1, classifier head removed, ONNX",
+  "model": "Logistic regression (C=0.01)",
+  "sklearn_version": "1.6.1",
+  "test_accuracy": 0.974,
+  "test_macro_f1": 0.9695,
+  "test_size": 576,
+  "train_size": 6021,
+  "trained_at": "2026-10-11T10:36:08",
+  "duplicate": {
+    "model": "Logistic regression (C=0.01)",
+    "threshold": 0.7,
+    "pair_features": "L2-normalised features of both photos: |a-b|, a*b, cosine similarity",
+    "test_precision": 0.986,
+    "test_recall": 0.9774,
+    "test_average_precision": 0.9989,
+    "test_pairs": 1728,
+    "train_pairs": 7728
+  }
+}

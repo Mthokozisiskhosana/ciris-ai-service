@@ -1,7 +1,10 @@
 fastapi>=0.115.0
 uvicorn>=0.30.6
 python-multipart>=0.0.9
-opencv-python-headless>=4.10.0
 numpy>=1.26.4
-scikit-learn>=1.5.2
+# Must match the version the model was trained with — the training notebook
+# prints it at the end (also in model_info.json). Replace with ==<that version>.
+scikit-learn==1.6.1
 joblib>=1.4.2
+onnxruntime>=1.18.0
+pillow>=10.0.0

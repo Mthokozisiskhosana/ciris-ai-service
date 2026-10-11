@@ -1,19 +1,33 @@
 """
 CIRIS AI Service
-Wraps the trained Random Forest classifier (classifier.pkl) behind an HTTP
-endpoint the Node backend can call. Run this on its own, separate from
+Wraps the trained photo classifier and the duplicate-detection model behind
+HTTP endpoints the Node backend can call. Run this on its own, separate from
 server.js, matching the architecture in the team handbook (Section 9.7).
+
+Model files (produced by the training notebook, Cirsi_fixed.ipynb — place
+them in this folder):
+    classifier.pkl            scikit-learn classifier, answers with category names
+    duplicate_model.pkl       scikit-learn duplicate detector, works on pairs of photos
+    feature_extractor.onnx    EfficientNet-B0 feature extractor, used by both models
+    model_info.json           categories, thresholds, preprocessing
 
 Run with:
     uvicorn main:app --reload --port 8000
 """
 
+import io
+import json
+from pathlib import Path
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
-import cv2
 import joblib
-import io
+import onnxruntime as ort
+import sklearn
+from PIL import Image, ImageOps
+
+HERE = Path(__file__).parent
 
 app = FastAPI(title="CIRIS AI Service")
 
@@ -26,101 +40,142 @@ app.add_middleware(
 )
 
 # Load the trained models once, at startup — not on every request.
+model = None
+feature_session = None
+model_info = {}
 try:
-    model = joblib.load("classifier.pkl")
+    model_info = json.loads((HERE / "model_info.json").read_text())
+    model = joblib.load(HERE / "classifier.pkl")
+    feature_session = ort.InferenceSession(str(HERE / "feature_extractor.onnx"), providers=["CPUExecutionProvider"])
     print("Classifier loaded successfully.")
     print("Categories:", list(model.classes_))
-except FileNotFoundError:
-    model = None
-    print("WARNING: classifier.pkl not found. Place it in this same folder.")
+    print("Confidence threshold:", model_info.get("confidence_threshold"))
+    trained_with = model_info.get("sklearn_version")
+    if trained_with and trained_with != sklearn.__version__:
+        print(f"WARNING: model was trained with scikit-learn {trained_with} but {sklearn.__version__} "
+              f"is installed. Pin scikit-learn=={trained_with} in requirements.txt.")
+except FileNotFoundError as err:
+    model = feature_session = None
+    print(f"WARNING: classifier files missing ({err.filename}). "
+          "Place classifier.pkl, feature_extractor.onnx and model_info.json in this folder.")
 
+# Features per pair of photos: |a-b|, a*b (1280 each) and their cosine similarity.
+PAIR_FEATURES = 2 * 1280 + 1
+
+dup_model = None
 try:
-    dup_model = joblib.load("duplicate_model.pkl")
-    print("Duplicate detection model loaded successfully.")
+    dup_model = joblib.load(HERE / "duplicate_model.pkl")
+    if getattr(dup_model, "n_features_in_", None) != PAIR_FEATURES:
+        dup_model = None
+        print("WARNING: duplicate_model.pkl is the old model (different features). "
+              "Replace it with the one from the training notebook.")
+    elif feature_session is None or "duplicate" not in model_info:
+        dup_model = None
+        print("WARNING: duplicate detection needs feature_extractor.onnx and model_info.json too.")
+    else:
+        print("Duplicate detection model loaded successfully.")
+        print("Duplicate threshold:", model_info["duplicate"]["threshold"])
 except FileNotFoundError:
-    dup_model = None
     print("WARNING: duplicate_model.pkl not found. Place it in this same folder.")
 
 
-def extract_features(image_bytes: bytes):
-    """
-    Identical to the feature extraction used during training in Colab —
-    this MUST match exactly, or the model will get features it was never
-    trained on and its predictions will be meaningless.
-    """
-    file_bytes = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    if img is None:
+# ======================================
+# CLASSIFIER FEATURES
+# Must match preprocess() in the training notebook exactly, or the model
+# gets features it was never trained on and its answers are meaningless.
+# ======================================
+def preprocess(img: Image.Image) -> np.ndarray:
+    size = model_info.get("image_size", 224)
+    mean = np.array(model_info.get("mean", [0.485, 0.456, 0.406]), dtype=np.float32)
+    std = np.array(model_info.get("std", [0.229, 0.224, 0.225]), dtype=np.float32)
+
+    img = img.resize((size, size), Image.Resampling.BILINEAR)
+    x = np.asarray(img, dtype=np.float32) / 255.0
+    x = (x - mean) / std
+    return x.transpose(2, 0, 1)
+
+
+def classifier_features(image_bytes: bytes):
+    """EfficientNet-B0 features (1, 1280) for one photo, or None if unreadable."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            # Same loading as training: respect the phone's rotation flag, then RGB.
+            rgb = ImageOps.exif_transpose(img).convert("RGB")
+    except Exception:
         return None
+    batch = preprocess(rgb)[np.newaxis]
+    return feature_session.run(None, {"input": batch})[0]
 
-    img = cv2.resize(img, (128, 128))
 
-    color_mean = img.mean(axis=(0, 1))
-    color_std = img.std(axis=(0, 1))
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 100, 200)
-    edge_density = edges.mean()
-
-    gray_mean = gray.mean()
-    gray_std = gray.std()
-
-    return np.concatenate([color_mean, color_std, [edge_density, gray_mean, gray_std]])
+# ======================================
+# DUPLICATE-DETECTION FEATURES
+# Must match pair_features() in the training notebook exactly.
+# ======================================
+def pair_features(f1: np.ndarray, f2: np.ndarray) -> np.ndarray:
+    f1 = f1 / (np.linalg.norm(f1, axis=1, keepdims=True) + 1e-8)
+    f2 = f2 / (np.linalg.norm(f2, axis=1, keepdims=True) + 1e-8)
+    cosine = (f1 * f2).sum(axis=1, keepdims=True)
+    return np.hstack([np.abs(f1 - f2), f1 * f2, cosine])
 
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "model_loaded": model is not None}
+    return {
+        "status": "running",
+        "model_loaded": model is not None,
+        "categories": [str(c) for c in model.classes_] if model is not None else [],
+    }
 
 
 @app.post("/classify")
 async def classify(image: UploadFile = File(...)):
     if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded. Check classifier.pkl is present.")
+        raise HTTPException(status_code=503, detail="Model not loaded. Check classifier.pkl, feature_extractor.onnx and model_info.json are present.")
 
-    image_bytes = await image.read()
-    features = extract_features(image_bytes)
-
+    features = classifier_features(await image.read())
     if features is None:
         raise HTTPException(status_code=400, detail="Could not read image. Ensure it's a valid JPEG/PNG.")
 
-    features = features.reshape(1, -1)  # sklearn expects a 2D array, one row per sample
-
-    prediction = model.predict(features)[0]
     probabilities = model.predict_proba(features)[0]
-    confidence = float(max(probabilities))
+    best = int(np.argmax(probabilities))
+    confidence = float(probabilities[best])
+    top_category = str(model.classes_[best])
+
+    # Below the threshold chosen in training, don't guess: the backend
+    # stores no category and staff see "Unclassified".
+    threshold = float(model_info.get("confidence_threshold", 0.5))
+    category = top_category if confidence >= threshold else None
 
     return {
-        "category": prediction,
-        "confidence": round(confidence, 3)
+        "category": category,
+        "confidence": round(confidence, 3),
+        "top_category": top_category,
     }
 
 
 @app.post("/check-duplicate")
 async def check_duplicate(image1: UploadFile = File(...), image2: UploadFile = File(...)):
     if dup_model is None:
-        raise HTTPException(status_code=503, detail="Duplicate detection model not loaded. Check duplicate_model.pkl is present.")
+        raise HTTPException(status_code=503, detail="Duplicate detection model not loaded. Check duplicate_model.pkl, feature_extractor.onnx and model_info.json are present.")
 
     bytes1 = await image1.read()
     bytes2 = await image2.read()
 
-    features1 = extract_features(bytes1)
-    features2 = extract_features(bytes2)
+    features1 = classifier_features(bytes1)
+    features2 = classifier_features(bytes2)
 
     if features1 is None or features2 is None:
         raise HTTPException(status_code=400, detail="Could not read one of the images.")
 
-    # Same transformation used during training: absolute difference
-    # between the two images' feature vectors.
-    diff = np.abs(features1 - features2).reshape(1, -1)
-
-    prediction = dup_model.predict(diff)[0]
-    probabilities = dup_model.predict_proba(diff)[0]
-    # Class 1 = duplicate, class 0 = not duplicate — confidence is the
-    # model's probability for whichever class it predicted.
-    confidence = float(probabilities[1] if prediction == 1 else probabilities[0])
+    # Probability that both photos show the same problem. Only at or above the
+    # threshold chosen in training is it called a duplicate (the backend then
+    # rejects the new report, so the threshold favours precision).
+    p_duplicate = float(dup_model.predict_proba(pair_features(features1, features2))[0, 1])
+    is_duplicate = p_duplicate >= float(model_info["duplicate"]["threshold"])
+    # Confidence is the model's probability for whichever answer it gave.
+    confidence = p_duplicate if is_duplicate else 1 - p_duplicate
 
     return {
-        "is_duplicate": bool(prediction == 1),
+        "is_duplicate": is_duplicate,
         "confidence": round(confidence, 3)
     }
